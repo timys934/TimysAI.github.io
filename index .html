@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TimysAI</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; background:#0f172a; color:#e2e8f0;
+         max-width:760px; margin:0 auto; padding:16px; display:flex;
+         flex-direction:column; height:100vh; gap:12px; }
+  h2 { color:#38bdf8; margin:0; }
+  #chat { flex:1; overflow-y:auto; background:#1e293b; border-radius:12px;
+          padding:16px; display:flex; flex-direction:column; gap:10px; }
+  .msg { padding:10px 14px; border-radius:12px; max-width:85%;
+         white-space:pre-wrap; word-wrap:break-word; line-height:1.4; }
+  .user { background:#38bdf8; color:#0f172a; align-self:flex-end; }
+  .bot  { background:#334155; align-self:flex-start; }
+  .bot a { color:#7dd3fc; }
+  .typing { opacity:.6; font-style:italic; }
+  .row { display:flex; gap:8px; }
+  input { flex:1; padding:12px; border-radius:8px; border:none;
+          background:#1e293b; color:#e2e8f0; font-size:15px; }
+  button { padding:12px 20px; border:none; border-radius:8px; background:#38bdf8;
+           color:#0f172a; font-weight:bold; cursor:pointer; }
+  button:hover { background:#7dd3fc; }
+  button:disabled { background:#475569; cursor:not-allowed; }
+  .hint { color:#64748b; font-size:12px; }
+</style>
+</head>
+<body>
+
+<h2>💬 TimysAI</h2>
+<div id="chat"></div>
+<div class="row">
+  <input id="input" placeholder="Напиши вопрос..." autocomplete="off">
+  <button id="send">Отправить</button>
+</div>
+<div class="hint" id="loadStatus">Загружаю базу знаний...</div>
+
+<script>
+/* ============================================================
+   Публичный Gist — токен НЕ нужен
+   ============================================================ */
+const GIST_ID  = "086c0d3e07cd5f1748abcb1e4a2eb9b8";
+const FILE     = "timysai_pairs.json";
+const CACHE_KEY = "timysai_client_pairs_v1";
+const CACHE_TTL = 15 * 60 * 1000;   // 15 минут
+
+let pairs = [];
+let netReady = false;
+
+/* ============================================================
+   Загрузка с кешем и fallback
+   ============================================================ */
+async function loadPairs() {
+  const status = document.getElementById('loadStatus');
+
+  // 1) свежий кеш?
+  try {
+    const cached = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
+    if (cached && Date.now() - cached.t < CACHE_TTL) {
+      pairs = cached.data;
+      status.textContent = `✅ ${pairs.length} пар (кеш)`;
+      trainNetwork();
+      return;
+    }
+  } catch {}
+
+  // 2) GitHub
+  try {
+    const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      headers: { "Accept": "application/vnd.github+json" }
+    });
+    if (!res.ok) throw new Error("GitHub: " + res.status);
+    const data = await res.json();
+    const f = data.files[FILE];
+    if (!f) throw new Error(`Файл ${FILE} не найден`);
+    pairs = JSON.parse(f.content);
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), data: pairs }));
+    status.textContent = `✅ Загружено ${pairs.length} пар`;
+    trainNetwork();
+  } catch (e) {
+    // 3) старый кеш, если есть
+    try {
+      const cached = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
+      if (cached) {
+        pairs = cached.data;
+        status.textContent = `⚠️ GitHub недоступен, ${pairs.length} пар из кеша`;
+        trainNetwork();
+        return;
+      }
+    } catch {}
+    status.textContent = "❌ " + e.message;
+  }
+}
+
+/* ============================================================
+   Нейросеть
+   ============================================================ */
+function tokenize(t) {
+  return t.toLowerCase().replace(/[?!.,;:()"«»]/g," ").split(/\s+/).filter(Boolean);
+}
+function stem(w) {
+  return w.replace(/(ами|ями|ов|ев|ий|ый|ой|ая|ое|ые|ах|ях|ы|а|е|у|о|и|й|ь)$/g,"").slice(0,6);
+}
+
+let vocab = [], vocabIndex = {}, answerList = [], net = null;
+
+function rebuildVocab() {
+  const words = new Set();
+  for (const p of pairs) for (const w of tokenize(p.q)) words.add(stem(w));
+  vocab = [...words];
+  vocabIndex = {};
+  vocab.forEach((w, i) => vocabIndex[w] = i);
+  answerList = [...new Set(pairs.map(p => p.a))];
+}
+function vectorize(t) {
+  const v = new Array(vocab.length).fill(0);
+  for (const w of tokenize(t)) {
+    const s = stem(w);
+    if (s in vocabIndex) v[vocabIndex[s]] = 1;
+  }
+  return v;
+}
+function randn() {
+  return Math.sqrt(-2*Math.log(Math.random())) * Math.cos(2*Math.PI*Math.random());
+}
+
+class Net {
+  constructor(nIn, nHid, nOut, lr=0.3) {
+    this.lr = lr; this.nHid = nHid;
+    this.W1 = Array.from({length:nIn}, () => Array.from({length:nHid}, () => randn()*Math.sqrt(2/nIn)));
+    this.b1 = new Array(nHid).fill(0);
+    this.W2 = Array.from({length:nHid}, () => Array.from({length:nOut}, () => randn()*Math.sqrt(2/nHid)));
+    this.b2 = new Array(nOut).fill(0);
+  }
+  forward(x) {
+    const a1 = new Array(this.nHid).fill(0);
+    for (let j = 0; j < this.nHid; j++) {
+      let s = this.b1[j];
+      for (let i = 0; i < x.length; i++) if (x[i]) s += x[i]*this.W1[i][j];
+      a1[j] = Math.max(0, s);
+    }
+    const z2 = new Array(this.b2.length).fill(0);
+    let max = -Infinity;
+    for (let k = 0; k < this.b2.length; k++) {
+      let s = this.b2[k];
+      for (let j = 0; j < this.nHid; j++) if (a1[j]) s += a1[j]*this.W2[j][k];
+      z2[k] = s; if (s > max) max = s;
+    }
+    let sum = 0;
+    const out = z2.map(v => { const e = Math.exp(v-max); sum += e; return e; });
+    for (let k = 0; k < out.length; k++) out[k] /= sum;
+    this.a1 = a1; this.out = out;
+    return out;
+  }
+  backward(x, yIdx) {
+    const dOut = this.out.slice(); dOut[yIdx] -= 1;
+    for (let j = 0; j < this.nHid; j++) {
+      if (!this.a1[j]) continue;
+      for (let k = 0; k < dOut.length; k++) this.W2[j][k] -= this.lr*dOut[k]*this.a1[j];
+    }
+    for (let k = 0; k < dOut.length; k++) this.b2[k] -= this.lr*dOut[k];
+    const dA1 = new Array(this.nHid).fill(0);
+    for (let j = 0; j < this.nHid; j++) {
+      if (!this.a1[j]) continue;
+      let s = 0;
+      for (let k = 0; k < dOut.length; k++) s += dOut[k]*this.W2[j][k];
+      dA1[j] = s;
+    }
+    for (let i = 0; i < x.length; i++) {
+      if (!x[i]) continue;
+      for (let j = 0; j < this.nHid; j++) this.W1[i][j] -= this.lr*dA1[j]*x[i];
+    }
+    for (let j = 0; j < this.nHid; j++) this.b1[j] -= this.lr*dA1[j];
+  }
+  train(X, Y, epochs) {
+    for (let e = 0; e < epochs; e++)
+      for (let i = 0; i < X.length; i++) { this.forward(X[i]); this.backward(X[i], Y[i]); }
+  }
+  predict(x) {
+    const p = this.forward(x);
+    let best = 0;
+    for (let k = 1; k < p.length; k++) if (p[k] > p[best]) best = k;
+    return { index: best, prob: p[best] };
+  }
+}
+
+function trainNetwork() {
+  if (pairs.length === 0) { netReady = false; return; }
+  rebuildVocab();
+  if (vocab.length === 0 || answerList.length === 0) { netReady = false; return; }
+  const X = pairs.map(p => vectorize(p.q));
+  const Y = pairs.map(p => answerList.indexOf(p.a));
+  const hidden = Math.max(8, Math.min(32, vocab.length*2));
+  net = new Net(vocab.length, hidden, answerList.length, 0.3);
+  net.train(X, Y, 2000);
+  netReady = true;
+}
+
+/* ============================================================
+   Википедия (fallback)
+   ============================================================ */
+async function wikiSearch(query) {
+  const cleaned = query.toLowerCase().replace(/[?!.,;:]/g,"")
+    .replace(/\b(что|такое|это|как|кто|такой|такая|чем|про|расскажи|объясни)\b/g,"")
+    .replace(/\s+/g," ").trim();
+  if (!cleaned) return null;
+  for (const v of [cleaned, cleaned.replace(/\s+/g,"-"), cleaned.replace(/\s+/g,""),
+                    cleaned.charAt(0).toUpperCase()+cleaned.slice(1)]) {
+    try {
+      const r = await fetch(`https://ru.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(v)}`);
+      if (r.ok) {
+        const d = await r.json();
+        if (d.type !== "disambiguation" && d.extract)
+          return { title:d.title, extract:d.extract,
+                   url:d.content_urls?.desktop?.page || `https://ru.wikipedia.org/wiki/${encodeURIComponent(v)}` };
+      }
+    } catch {}
+  }
+  try {
+    const params = new URLSearchParams({ action:"query", list:"search",
+      srsearch:cleaned, format:"json", srlimit:"5", origin:"*" });
+    const r = await fetch(`https://ru.wikipedia.org/w/api.php?${params}`);
+    const d = await r.json();
+    const hits = d?.query?.search;
+    if (!hits || !hits.length) return null;
+    const words = cleaned.split(/\s+/);
+    let best = hits[0], bestScore = -Infinity;
+    for (const h of hits) {
+      const t = h.title.toLowerCase();
+      let score = 0;
+      if (t === cleaned) score += 100;
+      else if (words.every(w => t.includes(w))) score += 50;
+      else if (words.some(w => t.includes(w))) score += 20;
+      score += 5 - hits.indexOf(h);
+      if (score > bestScore) { bestScore = score; best = h; }
+    }
+    const sRes = await fetch(`https://ru.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(best.title)}`);
+    if (!sRes.ok) return null;
+    const s = await sRes.json();
+    return { title:s.title||best.title, extract:s.extract||"",
+             url:s.content_urls?.desktop?.page || `https://ru.wikipedia.org/wiki/${encodeURIComponent(best.title)}` };
+  } catch { return null; }
+}
+
+/* ============================================================
+   Чат
+   ============================================================ */
+const chatEl = document.getElementById('chat');
+const inputEl = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+
+function addMsg(html, who, isHTML = true) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + who;
+  if (isHTML) d.innerHTML = html; else d.textContent = html;
+  chatEl.appendChild(d);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return d;
+}
+
+async function respond(text) {
+  if (net && netReady) {
+    const x = vectorize(text);
+    if (x.some(v => v > 0)) {
+      const { index, prob } = net.predict(x);
+      if (prob > 0.5) return { source:"net", text: answerList[index] };
+    }
+  }
+  const wiki = await wikiSearch(text);
+  if (wiki) {
+    return { source:"wiki",
+      html:`<b>${wiki.title.replace(/</g,"&lt;")}</b><br><br>${wiki.extract.replace(/</g,"&lt;")}<br><br>
+            <a href="${wiki.url}" target="_blank" rel="noopener">📖 Читать →</a>` };
+  }
+  return { source:"none", text:"Не знаю ответа 😕" };
+}
+
+sendBtn.onclick = async () => {
+  const text = inputEl.value.trim();
+  if (!text) return;
+  addMsg(text.replace(/</g,"&lt;"), 'user');
+  inputEl.value = '';
+  sendBtn.disabled = true;
+  const typing = addMsg("думаю...", "bot typing", false);
+  try {
+    const r = await respond(text);
+    typing.remove();
+    if (r.source === "wiki") addMsg(r.html, "bot");
+    else addMsg(r.text.replace(/</g,"&lt;"), "bot", true);
+  } catch (e) {
+    typing.remove();
+    addMsg("Ошибка: " + e.message, "bot");
+  } finally {
+    sendBtn.disabled = false;
+    inputEl.focus();
+  }
+};
+inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') sendBtn.click(); });
+
+addMsg("Привет! Я TimysAI. Спрашивай что-нибудь.", "bot", false);
+loadPairs();
+</script>
+</body>
+</html>
